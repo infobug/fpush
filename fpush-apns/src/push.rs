@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use log::{debug, error};
 use serde_json::Value;
 
-use crate::AppleApnsConfig;
+use crate::config::{ApnsAuth, AppleApnsConfig};
+
 pub struct FpushApns {
     apns: a2::client::Client,
     topic: String,
@@ -19,39 +20,44 @@ pub struct FpushApns {
 }
 
 impl FpushApns {
-    fn open_cert(filename: &str) -> PushResult<std::fs::File> {
-        if let Ok(file) = std::fs::File::open(filename) {
-            Ok(file)
-        } else {
-            Err(PushError::CertLoading)
-        }
+    fn open_file(filename: &str) -> PushResult<std::fs::File> {
+        std::fs::File::open(filename).map_err(|e| {
+            error!("Could not open file {}: {}", filename, e);
+            PushError::CertLoading
+        })
     }
 
     pub fn init(apns_config: &AppleApnsConfig) -> PushResult<Self> {
-        let mut certificate = FpushApns::open_cert(apns_config.cert_file_path())?;
-
         let mut client_config = ClientConfig::new(apns_config.endpoint());
         client_config.pool_idle_timeout_secs = Some(apns_config.pool_idle_timeout());
         client_config.request_timeout_secs = Some(apns_config.request_timeout());
 
-        match Client::certificate(&mut certificate, apns_config.cert_password(), client_config) {
-            Ok(apns_conn) => {
-                let wrapped_conn = Self {
-                    apns: apns_conn,
-                    topic: apns_config.topic().to_string(),
-                    additional_data: apns_config.additional_data().clone(),
-                };
-                Ok(wrapped_conn)
+        let apns_conn = match apns_config.auth() {
+            Some(ApnsAuth::Certificate { path, password }) => {
+                let mut cert_file = Self::open_file(path)?;
+                Client::certificate(&mut cert_file, password, client_config).map_err(|e| {
+                    error!("Problem initializing apple certificate config: {}", e);
+                    PushError::PushEndpointTmp
+                })?
             }
-            Err(a2::error::Error::ReadError(e)) => {
-                error!("Could not read apns: {}", e);
-                Err(PushError::PushEndpointPersistent)
+            Some(ApnsAuth::Token { key_path, key_id, team_id }) => {
+                let key_file = Self::open_file(key_path)?;
+                Client::token(key_file, key_id, team_id, client_config).map_err(|e| {
+                    error!("Problem initializing apple token config: {}", e);
+                    PushError::PushEndpointTmp
+                })?
             }
-            Err(e) => {
-                error!("Problem initializing apple config: {}", e);
-                Err(PushError::PushEndpointTmp)
+            None => {
+                error!("APNs config requires either (certFilePath + certPassword) or (keyPath + keyId + teamId)");
+                return Err(PushError::CertLoading);
             }
-        }
+        };
+
+        Ok(Self {
+            apns: apns_conn,
+            topic: apns_config.topic().to_string(),
+            additional_data: apns_config.additional_data().clone(),
+        })
     }
 }
 
