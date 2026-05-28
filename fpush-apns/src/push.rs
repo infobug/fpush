@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a2::{
-    request::payload::PayloadLike, Client, ClientConfig, DefaultNotificationBuilder,
-    NotificationBuilder, NotificationOptions, Priority, PushType,
+    request::notification::CollapseId, request::payload::PayloadLike, Client, ClientConfig,
+    DefaultNotificationBuilder, NotificationBuilder, NotificationOptions, Priority, PushType,
 };
 use fpush_traits::push::{PushError, PushResult, PushTrait};
 
@@ -65,11 +65,25 @@ impl FpushApns {
 impl PushTrait for FpushApns {
     #[inline(always)]
     async fn send(&self, token: String) -> PushResult<()> {
+        // APNs payload structure matches Signal-Server APNSender's APN_NSE_NOTIFICATION_PAYLOAD:
+        //   - mutable-content: 1 (wakes the NSE)
+        //   - alert title/body present so iOS shows something if NSE fails to replace it
+        //   - NO sound: the NSE-posted notification carries the user's chosen sound;
+        //     when NSE fails (and the fallback alert is what shows), match Signal's
+        //     silent-failure UX rather than inconsistent audio cues.
         let notification_builder = DefaultNotificationBuilder::new()
             .set_title("New Message")
             .set_body("New Message?")
-            .set_mutable_content()
-            .set_sound("default");
+            .set_mutable_content();
+        // Signal-Server uses apns-collapse-id "incoming-message" on every push.
+        // Effect: if NSE fails to post a user-visible notification (rare after
+        // recent NSE minimization work) AND multiple pushes arrive while the
+        // device is locked, the fallback alerts collapse to one entry on the
+        // lock screen instead of stacking N copies of "New Message". The
+        // per-conversation notifications NSE posts via UNUserNotificationCenter
+        // use their own identifiers and are unaffected.
+        let collapse_id = CollapseId::new("incoming-message")
+            .expect("collapse id literal fits the 64-byte limit");
         let mut payload = notification_builder.build(
             &token,
             NotificationOptions {
@@ -79,6 +93,7 @@ impl PushTrait for FpushApns {
                     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 4 * 7 * 24 * 3600,
                 ),
                 apns_push_type: Some(PushType::Alert),
+                apns_collapse_id: Some(collapse_id),
                 ..Default::default()
             },
         );
